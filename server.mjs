@@ -340,6 +340,26 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
   return true;
 }
 
+async function ensureDirectSigningSdk() {
+  let ready = await page.evaluate(
+    () => typeof window.__sdkN !== "undefined",
+  );
+  if (!ready && sdk368) {
+    console.log("[Server] Initializing patched direct-signing SDK...");
+    await page.evaluate((sdkCode) => {
+      (0, eval)(sdkCode);
+    }, sdk368);
+    await new Promise((r) => setTimeout(r, 500));
+    ready = await page.evaluate(
+      () => typeof window.__sdkN !== "undefined",
+    );
+  }
+  if (!ready) {
+    throw new Error("Direct-signing SDK failed to initialize");
+  }
+  console.log("[Server] Direct-signing SDK ready");
+}
+
 /**
  * Initialize with TikTok page context and LOCAL SDK
  * Injects local SDK BEFORE page loads using evaluateOnNewDocument
@@ -466,6 +486,11 @@ async function initWithLocalSdk() {
   // click its in-page Refresh button to retry once more.
   await dismissTikTokErrorIfPresent();
 
+  // The public acrawler object and the patched direct signer are separate.
+  // Comment APIs require the latter; initialize it deterministically instead
+  // of waiting for a page bundle to happen to request this SDK version.
+  await ensureDirectSigningSdk();
+
   // Extract cookies for use in requests
   cookies = await page.cookies();
   console.log(`[Server] Captured ${cookies.length} cookies`);
@@ -499,6 +524,25 @@ async function closeBrowser() {
   }
 
   console.log("[Server] Browser closed, all state reset");
+}
+
+async function refreshBrowserSession(targetUrl = "https://www.tiktok.com/") {
+  await initBrowser();
+  await ensurePageReady();
+
+  console.log("[Server] Refreshing browser session:", targetUrl.substring(0, 80));
+  await page.goto(targetUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+  await new Promise((r) => setTimeout(r, 3000));
+  await dismissTikTokErrorIfPresent();
+  cookies = await page.cookies();
+
+  return {
+    cookieCount: cookies.length,
+    url: page.url(),
+  };
 }
 
 /**
@@ -995,26 +1039,64 @@ async function handleRequest(req, res) {
         targetUrl.substring(0, 80) + "...",
       );
 
-      const fetchResult = await page.evaluate(async (url) => {
-        try {
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          });
-          const text = await response.text();
-          return {
-            status: response.status,
-            bodyLength: text.length,
-            data: text ? JSON.parse(text) : null,
-          };
-        } catch (e) {
-          return { error: e.message };
+      // Some TikTok endpoints (notably comments/replies) return HTTP 200 with
+      // an empty body when called without X-Bogus/X-Gnarly. Sign first, then
+      // execute that exact URL in the same browser session.
+      const signedFetch = await generateSignedUrl(targetUrl);
+      const signedTargetUrl = signedFetch.signedUrl;
+
+      let fetchResult;
+      try {
+        // Do not use page.evaluate(fetch): TikTok's in-page SDK intercepts the
+        // call and can rewrite an already-signed comment URL into a request
+        // that returns HTTP 200 with an empty body. Use the browser-generated
+        // signature/session from Node so the signed URL stays byte-for-byte.
+        const response = await fetch(signedTargetUrl, {
+          headers: {
+            "User-Agent": signedFetch.userAgent || currentUserAgent,
+            Cookie: signedFetch.cookies || "",
+            Accept:
+              "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            Referer: "https://www.tiktok.com/",
+          },
+        });
+        const text = await response.text();
+        const contentType = response.headers.get("content-type") || "";
+        let data = text;
+
+        if (text) {
+          const trimmed = text.trim();
+          const looksLikeJson =
+            contentType.includes("application/json") ||
+            trimmed.startsWith("{") ||
+            trimmed.startsWith("[");
+          if (looksLikeJson) {
+            try {
+              data = JSON.parse(text);
+            } catch (e) {
+              data = text;
+            }
+          }
         }
-      }, targetUrl);
+
+        fetchResult = {
+          status: response.status,
+          statusText: response.statusText,
+          bodyLength: text.length,
+          contentType,
+          responseUrl: response.url,
+          data,
+        };
+      } catch (e) {
+        fetchResult = { error: e.message };
+      }
 
       console.log(
         "[Server] Fetch result:",
-        fetchResult.error || `${fetchResult.bodyLength} bytes`,
+        fetchResult.error ||
+          `HTTP ${fetchResult.status} ${fetchResult.statusText || ""}, ` +
+            `${fetchResult.bodyLength} bytes, ` +
+            `content-type=${fetchResult.contentType || "(none)"}`,
       );
 
       if (fetchResult.error) {
@@ -1030,7 +1112,52 @@ async function handleRequest(req, res) {
         JSON.stringify({
           status: "ok",
           httpStatus: fetchResult.status,
+          contentType: fetchResult.contentType,
           data: fetchResult.data,
+        }),
+      );
+      return;
+    }
+
+    if (url.pathname === "/session") {
+      await initBrowser();
+      await ensurePageReady();
+
+      cookies = await page.cookies();
+      const cookieString = cookies
+        ? cookies.map((c) => `${c.name}=${c.value}`).join("; ")
+        : "";
+      const userAgent = await page.evaluate(() => navigator.userAgent);
+
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          data: {
+            cookies: cookieString,
+            navigator: {
+              user_agent: userAgent || currentUserAgent,
+              platform: "MacIntel",
+              browser_language: "en-US",
+              os: "mac",
+              screen_width: "1920",
+              screen_height: "1080",
+            },
+          },
+        }),
+      );
+      return;
+    }
+
+    if (url.pathname === "/refresh") {
+      const targetUrl = url.searchParams.get("url") || "https://www.tiktok.com/";
+      const refreshResult = await refreshBrowserSession(targetUrl);
+
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          data: refreshResult,
         }),
       );
       return;

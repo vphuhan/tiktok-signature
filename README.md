@@ -97,7 +97,11 @@ curl -X POST http://localhost:8080/signature \
 
 ### POST /fetch (Fallback)
 
-Fetch data directly through the browser. This endpoint makes the actual API request through the browser session, bypassing TikTok's bot detection entirely.
+Sign the URL using the browser session, then fetch it with that session's
+cookies and user agent. The final request runs outside the page so TikTok's
+in-page SDK cannot rewrite an already-signed request. This is required by
+stricter endpoints such as comments and comment replies, which may otherwise
+return HTTP 200 with an empty body.
 
 **Use this only as a fallback** when external requests with signed URLs fail. This endpoint is slower and less scalable because each request goes through the browser.
 
