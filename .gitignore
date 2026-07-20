@@ -1,3 +1,6 @@
+# Browser profiles
+.chrome-profile/
+.generic-browser-profile/
 # Dependencies
 node_modules/
 npm-debug.log*

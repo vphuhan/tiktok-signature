@@ -27,10 +27,26 @@ import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
 
-// Use stealth plugin with default evasions
-puppeteer.use(StealthPlugin());
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function availableStealthEvasions() {
+  const evasionsDir = path.join(
+    __dirname,
+    "node_modules",
+    "puppeteer-extra-plugin-stealth",
+    "evasions",
+  );
+  const defaults = StealthPlugin().availableEvasions;
+  return new Set(
+    [...defaults].filter((evasion) =>
+      fs.existsSync(path.join(evasionsDir, evasion, "index.js")),
+    ),
+  );
+}
+
+// Use stealth plugin with the evasions present in this installed package.
+puppeteer.use(StealthPlugin({ enabledEvasions: availableStealthEvasions() }));
+
 const PORT = process.env.PORT || 8080;
 
 // Custom user data directory to avoid filling /tmp
